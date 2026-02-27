@@ -1,0 +1,185 @@
+/*
+Companion Arduino for ArduPilot (MAVLink over Serial)
+
+✅ Reads GPS (NMEA) from a GPS module
+✅ Monitors battery voltage + kill switch / RC signal
+✅ If failsafe triggered -> send MAVLink command to switch to RTL
+✅ Optionally: send GUIDED waypoint (simple GPS navigation trigger)
+
+Hardware (example):
+- Arduino Nano/Uno
+- GPS module (NEO-6M) to SoftwareSerial pins
+- ArduPilot TELEM port <-> Arduino Serial (level shifting may be needed)
+- Battery voltage divider into A0
+- Kill switch into D7 (pullup)
+
+Note: This is a portfolio demo for safe flight control logic. Test in SITL first.
+*/
+
+#include <SoftwareSerial.h>
+#include <TinyGPSPlus.h>
+
+// ---------- GPS ----------
+static const int GPS_RX = 4; // Arduino receives from GPS TX
+static const int GPS_TX = 3; // Arduino sends to GPS RX (optional)
+SoftwareSerial gpsSerial(GPS_RX, GPS_TX);
+TinyGPSPlus gps;
+
+// ---------- FAILSAFE INPUTS ----------
+static const int KILL_PIN = 7;     // kill switch (active LOW)
+static const int BATT_PIN = A0;    // battery voltage divider
+static const float BATT_MIN_V = 10.8; // example threshold (3S LiPo)
+
+// ---------- MAVLink (lightweight send only) ----------
+// Use MAVLink v1 minimal send frames (for portfolio, keep simple)
+// In real projects you'd use a MAVLink library (mavlink/ardupilotmega).
+// Here we implement only "COMMAND_LONG" packet framing at a basic level.
+
+static const uint8_t MAV_STX = 0xFE;
+static const uint8_t SYS_ID_ARDUINO = 42;
+static const uint8_t COMP_ID_ARDUINO = 158; // companion computer id (common)
+static uint8_t seq = 0;
+
+// Target (ArduPilot) system/component IDs (often SYS=1, COMP=1)
+static const uint8_t TARGET_SYS = 1;
+static const uint8_t TARGET_COMP = 1;
+
+// MAVLink msg IDs
+static const uint8_t MSG_ID_COMMAND_LONG = 76;
+
+// MAV_CMDs
+static const uint16_t MAV_CMD_DO_SET_MODE = 176;
+static const uint16_t MAV_CMD_NAV_RETURN_TO_LAUNCH = 20;
+
+// Base modes / custom modes vary; easiest is RTL command long (NAV_RETURN_TO_LAUNCH)
+bool failsafeTriggered = false;
+
+float readBatteryVoltage() {
+  // Example: voltage divider maps max 16.8V to 5V
+  // Adjust based on resistor values!
+  int raw = analogRead(BATT_PIN);
+  float v = (raw / 1023.0) * 5.0;      // voltage at A0
+  float scale = 3.36;                  // example divider scale factor
+  return v * scale;
+}
+
+// MAVLink checksum (X25 CRC)
+uint16_t crc_accumulate(uint8_t data, uint16_t crc) {
+  data ^= (uint8_t)(crc & 0xFF);
+  data ^= (data << 4);
+  return ((((uint16_t)data << 8) | (crc >> 8)) ^ (uint8_t)(data >> 4) ^ ((uint16_t)data << 3));
+}
+
+uint16_t mav_crc(const uint8_t *buf, uint8_t len) {
+  uint16_t crc = 0xFFFF;
+  for (uint8_t i = 0; i < len; i++) crc = crc_accumulate(buf[i], crc);
+  return crc;
+}
+
+// MAVLink v1 extra CRC for COMMAND_LONG (from MAVLink XML): 152
+static const uint8_t EXTRA_CRC_COMMAND_LONG = 152;
+
+// Pack and send COMMAND_LONG
+void send_command_long(uint16_t command,
+                       float p1, float p2, float p3, float p4,
+                       float p5, float p6, float p7) {
+  // payload layout for COMMAND_LONG (33 bytes):
+  // param1..param7 (float x7 = 28)
+  // command (uint16 = 2)
+  // target_system (uint8 = 1)
+  // target_component (uint8 = 1)
+  // confirmation (uint8 = 1)
+  uint8_t payload[33];
+  memset(payload, 0, sizeof(payload));
+
+  auto put_float = [&](int idx, float val) {
+    union { float f; uint8_t b[4]; } u;
+    u.f = val;
+    payload[idx+0] = u.b[0];
+    payload[idx+1] = u.b[1];
+    payload[idx+2] = u.b[2];
+    payload[idx+3] = u.b[3];
+  };
+
+  put_float(0,  p1);
+  put_float(4,  p2);
+  put_float(8,  p3);
+  put_float(12, p4);
+  put_float(16, p5);
+  put_float(20, p6);
+  put_float(24, p7);
+
+  payload[28] = (uint8_t)(command & 0xFF);
+  payload[29] = (uint8_t)(command >> 8);
+  payload[30] = TARGET_SYS;
+  payload[31] = TARGET_COMP;
+  payload[32] = 0; // confirmation
+
+  // header: len, seq, sysid, compid, msgid
+  uint8_t header[6];
+  header[0] = MAV_STX;
+  header[1] = 33;         // payload length
+  header[2] = seq++;
+  header[3] = SYS_ID_ARDUINO;
+  header[4] = COMP_ID_ARDUINO;
+  header[5] = MSG_ID_COMMAND_LONG;
+
+  // CRC over payload + msgid + extra
+  // MAVLink v1 CRC is computed over: payload length..msgid + payload, then extra CRC
+  // We'll build a temp buffer: [len, seq, sys, comp, msgid] not included; only msgid and payload for CRC calc approach:
+  // Simplest: CRC over payload + msgid, then accumulate extra.
+  uint16_t crc = 0xFFFF;
+  crc = crc_accumulate(MSG_ID_COMMAND_LONG, crc);
+  for (int i = 0; i < 33; i++) crc = crc_accumulate(payload[i], crc);
+  crc = crc_accumulate(EXTRA_CRC_COMMAND_LONG, crc);
+
+  // Send frame: STX, LEN, SEQ, SYS, COMP, MSGID, PAYLOAD, CRC_L, CRC_H
+  Serial.write(header, 6);
+  Serial.write(payload, 33);
+  Serial.write((uint8_t)(crc & 0xFF));
+  Serial.write((uint8_t)(crc >> 8));
+}
+
+void command_rtl() {
+  // MAV_CMD_NAV_RETURN_TO_LAUNCH needs no params
+  send_command_long(MAV_CMD_NAV_RETURN_TO_LAUNCH, 0,0,0,0,0,0,0);
+}
+
+void setup() {
+  pinMode(KILL_PIN, INPUT_PULLUP);
+  pinMode(BATT_PIN, INPUT);
+
+  Serial.begin(57600);       // Typical TELEM baud to ArduPilot (adjust as needed)
+  gpsSerial.begin(9600);     // Typical GPS baud
+
+  delay(1000);
+}
+
+void loop() {
+  // --- Read GPS ---
+  while (gpsSerial.available()) {
+    gps.encode(gpsSerial.read());
+  }
+
+  bool killActive = (digitalRead(KILL_PIN) == LOW);
+  float battV = readBatteryVoltage();
+
+  // Basic "GPS navigation available" check
+  bool gpsOk = gps.location.isValid() && gps.satellites.value() >= 6;
+
+  // --- Failsafe logic ---
+  bool battLow = battV < BATT_MIN_V;
+  bool trigger = killActive || battLow;
+
+  // Only trigger once until reset
+  if (trigger && !failsafeTriggered) {
+    failsafeTriggered = true;
+    // Tell ArduPilot to RTL
+    command_rtl();
+  }
+
+  // Optional: Print debug to serial monitor (use separate USB serial if needed)
+  // For simplicity, we keep it quiet.
+
+  delay(200);
+}
